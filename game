@@ -1,0 +1,343 @@
+/*
+ * OS Racer - Kernel Edition v3.2 (High Speed Tuning)
+ * Update: 
+ * 1. Centrifugal force reduced significantly (0.6 -> 0.05) to allow cornering at high speeds.
+ * 2. Steering sensitivity increased (1.5 -> 2.0).
+ * 3. Track curvature further reduced for smoother high-speed driving.
+ * Author: Gemini
+ */
+
+// 啟用 C++11
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cwchar> 
+#include <windows.h>
+
+using namespace std;
+
+// --- 系統常數 ---
+const int nScreenWidth = 120;
+const int nScreenHeight = 40;
+const float ROAD_WIDTH_LIMIT = 1.0f; 
+
+// Unicode 視覺資產
+const wchar_t CHAR_FULL = L'\u2588';
+const wchar_t CHAR_DARK = L'\u2593'; 
+const wchar_t CHAR_MED = L'\u2592';
+const wchar_t CHAR_LIGHT = L'\u2591';
+const wchar_t CHAR_EMPTY = L' ';
+
+enum GameState { BOOT_MENU, KERNEL_RUNNING, SYSTEM_HALT };
+GameState currentState = BOOT_MENU;
+
+// --- 1. PCB (Process Control Block) ---
+struct PlayerPCB {
+    int PID;
+    float fX_Register;      // X 座標
+    float fSpeed;           // 速度
+    float fDistance;        // 總里程
+    float fCurvature;       // 當前曲率
+    float fPlayerCurvature; // 累積視覺偏移
+    bool bCrashed;          // 當機狀態
+
+    PlayerPCB() : PID(86), fX_Register(0), fSpeed(0), fDistance(0), fCurvature(0), fPlayerCurvature(0), bCrashed(false) {}
+    
+    void Reset() {
+        fX_Register = 0; fSpeed = 0; fDistance = 0; fCurvature = 0; fPlayerCurvature = 0; bCrashed = false;
+    }
+};
+PlayerPCB player; 
+
+struct TrackSegment {
+    float fCurvature;
+    float fDistance;
+};
+vector<TrackSegment> vecTrack;
+
+// --- 地圖系統 (GPS System) ---
+vector<pair<float, float>> vecMapPoints;
+float fTotalTrackLength = 0;
+
+// --- 系統函式 ---
+void SetupTrack() {
+    // [修正重點 3] 賽道曲率再縮小，變成高速賽道
+    // 數值越接近 0 越直，正數右彎，負數左彎
+    vecTrack.push_back({ 0.0f, 50.0f });   // 直線
+    vecTrack.push_back({ 0.2f, 200.0f });  // 右微彎
+    vecTrack.push_back({ 0.0f, 100.0f });  
+    vecTrack.push_back({ -0.4f, 150.0f }); // 左彎
+    vecTrack.push_back({ 0.0f, 150.0f });
+    vecTrack.push_back({ -0.2f, 200.0f }); 
+    vecTrack.push_back({ 0.5f, 150.0f });  // 右彎 (原本最急的彎，現在也變緩了)
+    vecTrack.push_back({ 0.0f, 300.0f });  // 終點長直線
+
+    // --- 預先計算地圖座標 ---
+    float x = 0, y = 0, angle = 0;
+    fTotalTrackLength = 0;
+    vecMapPoints.clear();
+    
+    for (auto t : vecTrack) {
+        float fSegmentStep = 5.0f; 
+        for (float d = 0; d < t.fDistance; d += fSegmentStep) {
+            angle += t.fCurvature * 0.01f; 
+            x += sinf(angle) * fSegmentStep;
+            y += cosf(angle) * fSegmentStep;
+            vecMapPoints.push_back({ x, y });
+        }
+        fTotalTrackLength += t.fDistance;
+    }
+}
+
+void EnforceBoundaryProtection() {
+    float fLeftLimit = -ROAD_WIDTH_LIMIT;
+    float fRightLimit = ROAD_WIDTH_LIMIT;
+
+    // 允許倒車脫困
+    if (player.bCrashed && player.fSpeed < -0.1f) player.bCrashed = false; 
+
+    if (player.fX_Register < fLeftLimit) {
+        player.fX_Register = fLeftLimit;
+        if (player.fSpeed > 0) { player.fSpeed = 0; player.bCrashed = true; }
+    }
+    if (player.fX_Register > fRightLimit) {
+        player.fX_Register = fRightLimit;
+        if (player.fSpeed > 0) { player.fSpeed = 0; player.bCrashed = true; }
+    }
+}
+
+void KernelDrawBox(wchar_t* screen, int x, int y, int w, int h) {
+    for (int i = 0; i < h; i++) {
+        for (int j = 0; j < w; j++) {
+            int px = x + j;
+            int py = y + i;
+            if (px >= 0 && px < nScreenWidth && py >= 0 && py < nScreenHeight) {
+                 if (i == 0 || i == h - 1) screen[py * nScreenWidth + px] = L'\u2550';
+                else if (j == 0 || j == w - 1) screen[py * nScreenWidth + px] = L'\u2551';
+                else screen[py * nScreenWidth + px] = CHAR_EMPTY;
+                
+                if (i==0 && j==0) screen[py * nScreenWidth + px] = L'\u2554';
+                else if (i==0 && j==w-1) screen[py * nScreenWidth + px] = L'\u2557';
+                else if (i==h-1 && j==0) screen[py * nScreenWidth + px] = L'\u255A';
+                else if (i==h-1 && j==w-1) screen[py * nScreenWidth + px] = L'\u255D';
+            }
+        }
+    }
+}
+
+void KernelDrawString(wchar_t* screen, int x, int y, wstring text) {
+    for (int i = 0; i < text.length(); i++) {
+        if (x + i >= 0 && x + i < nScreenWidth && y >= 0 && y < nScreenHeight)
+            screen[y * nScreenWidth + x + i] = text[i];
+    }
+}
+
+void DrawMiniMap(wchar_t* screen, int mapX, int mapY, int mapW, int mapH) {
+    KernelDrawBox(screen, mapX, mapY, mapW, mapH);
+    KernelDrawString(screen, mapX + 2, mapY, L"GPS TRACKER");
+
+    float minX = 10000, maxX = -10000, minY = 10000, maxY = -10000;
+    for (auto p : vecMapPoints) {
+        if (p.first < minX) minX = p.first;
+        if (p.first > maxX) maxX = p.first;
+        if (p.second < minY) minY = p.second;
+        if (p.second > maxY) maxY = p.second;
+    }
+    
+    float scaleX = (float)(mapW - 4) / (maxX - minX);
+    float scaleY = (float)(mapH - 4) / (maxY - minY);
+    float scale = (scaleX < scaleY) ? scaleX : scaleY; 
+
+    for (auto p : vecMapPoints) {
+        int px = mapX + 2 + (int)((p.first - minX) * scale);
+        int py = mapY + mapH - 2 - (int)((p.second - minY) * scale); 
+        if(px >= 0 && px < nScreenWidth && py >= 0 && py < nScreenHeight)
+            screen[py * nScreenWidth + px] = L'.';
+    }
+
+    int playerIndex = (int)((player.fDistance / fTotalTrackLength) * vecMapPoints.size()) % vecMapPoints.size();
+    if (playerIndex < 0) playerIndex += vecMapPoints.size();
+    
+    if (!vecMapPoints.empty()) {
+        pair<float, float> pos = vecMapPoints[playerIndex];
+        int px = mapX + 2 + (int)((pos.first - minX) * scale);
+        int py = mapY + mapH - 2 - (int)((pos.second - minY) * scale);
+        if(px >= 0 && px < nScreenWidth && py >= 0 && py < nScreenHeight)
+            screen[py * nScreenWidth + px] = L'P'; 
+    }
+}
+
+int main() {
+    wchar_t* screen = new wchar_t[nScreenWidth * nScreenHeight];
+    HANDLE hConsole = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE, 0, NULL, CONSOLE_TEXTMODE_BUFFER, NULL);
+    SetConsoleActiveScreenBuffer(hConsole);
+    
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hConsole, &cursorInfo);
+    cursorInfo.bVisible = FALSE;
+    SetConsoleCursorInfo(hConsole, &cursorInfo);
+
+    DWORD dwBytesWritten = 0;
+    SetupTrack();
+
+    auto tp1 = chrono::system_clock::now();
+    auto tp2 = chrono::system_clock::now();
+    
+    float fTotalTime = 0.0f;
+
+    while (currentState != SYSTEM_HALT) {
+        tp2 = chrono::system_clock::now();
+        chrono::duration<float> elapsedTime = tp2 - tp1;
+        tp1 = tp2;
+        float fElapsedTime = elapsedTime.count();
+        fTotalTime += fElapsedTime;
+
+        if (currentState == BOOT_MENU) {
+            for (int i = 0; i < nScreenWidth * nScreenHeight; i++) screen[i] = CHAR_MED;
+            int boxW = 44, boxH = 12;
+            int boxX = (nScreenWidth - boxW) / 2;
+            int boxY = (nScreenHeight - boxH) / 2;
+            KernelDrawBox(screen, boxX, boxY, boxW, boxH);
+            KernelDrawString(screen, boxX + 12, boxY + 2, L"OS RACER : KERNEL v3.2");
+            KernelDrawString(screen, boxX + 10, boxY + 5, L"PRESS [SPACE] TO BOOT");
+            KernelDrawString(screen, boxX + 10, boxY + 7, L"PRESS [ESC] TO SHUTDOWN");
+            
+            if (GetAsyncKeyState(VK_SPACE) & 0x1) {
+                player.Reset();
+                currentState = KERNEL_RUNNING;
+            }
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x1) currentState = SYSTEM_HALT;
+        }
+        else if (currentState == KERNEL_RUNNING) {
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x1) currentState = BOOT_MENU;
+            
+            // [修正重點 2] 增加轉向靈敏度 (1.5 -> 2.0)
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000) player.fX_Register -= 2.0f * fElapsedTime;
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000) player.fX_Register += 2.0f * fElapsedTime;
+            
+            // --- 速度控制 ---
+            if (!player.bCrashed) {
+                if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
+                    player.fSpeed += 40.0f * fElapsedTime; 
+                }
+                else if (GetAsyncKeyState(VK_DOWN) & 0x8000) {
+                     player.fSpeed -= 30.0f * fElapsedTime; 
+                }
+                else {
+                    if (player.fSpeed > 0) {
+                        player.fSpeed -= 15.0f * fElapsedTime; 
+                        if (player.fSpeed < 0) player.fSpeed = 0; 
+                    }
+                    else if (player.fSpeed < 0) {
+                        player.fSpeed += 15.0f * fElapsedTime; 
+                        if (player.fSpeed > 0) player.fSpeed = 0; 
+                    }
+                }
+            } else {
+                if (GetAsyncKeyState(VK_DOWN) & 0x8000) player.fSpeed -= 30.0f * fElapsedTime;
+                else player.fSpeed = 0;
+            }
+
+            if (GetAsyncKeyState(VK_CONTROL) & 0x8000) player.fSpeed -= 80.0f * fElapsedTime;
+
+            // [修正重點 1] 大幅降低離心力係數 (0.6 -> 0.05)
+            // 這樣即使在速度 100 時，離心偏移量也只有 0.5 (曲率) * 100 * 0.05 = 2.5
+            // 而我們的轉向力有 2.0，只要適當減速或切彎即可通過，不需要降到 40 以下
+            player.fX_Register -= player.fCurvature * player.fSpeed * fElapsedTime * 0.05f; 
+            
+            EnforceBoundaryProtection();
+
+            if (player.fSpeed < -20.0f) player.fSpeed = -20.0f; 
+            if (player.fSpeed > 100.0f) player.fSpeed = 100.0f; 
+
+            player.fDistance += player.fSpeed * fElapsedTime;
+
+            // 賽道 Loop
+            int nTrackSection = 0;
+            float fTrackPos = player.fDistance;
+            while (nTrackSection < vecTrack.size() && fTrackPos >= vecTrack[nTrackSection].fDistance) {
+                fTrackPos -= vecTrack[nTrackSection].fDistance;
+                nTrackSection++;
+            }
+            if (nTrackSection >= vecTrack.size()) { player.fDistance = 0; nTrackSection = 0; }
+            
+            float fTargetCurvature = vecTrack[nTrackSection].fCurvature;
+            float fTrackCurveDiff = (fTargetCurvature - player.fCurvature) * fElapsedTime * abs(player.fSpeed) * 0.02f; 
+            player.fCurvature += fTrackCurveDiff;
+            player.fPlayerCurvature += player.fCurvature * fElapsedTime * player.fSpeed * 0.01f;
+
+            // --- 渲染 ---
+            for (int y = 0; y < nScreenHeight / 2; y++) {
+                for (int x = 0; x < nScreenWidth; x++) {
+                    float mountainFreq = (x + player.fPlayerCurvature * 200.0f) * 0.02f;
+                    int mountainH = (int)(sinf(mountainFreq) * 8.0f + 6.0f);
+                    screen[y * nScreenWidth + x] = (y < nScreenHeight / 2 - mountainH) ? CHAR_EMPTY : CHAR_MED;
+                }
+            }
+
+            for (int y = 0; y < nScreenHeight / 2; y++) {
+                float fPerspective = (float)y / (nScreenHeight / 2.0f);
+                float fMiddlePoint = 0.5f + player.fCurvature * powf(1.0f - fPerspective, 3.0f) - player.fX_Register * 0.5f;
+                float fRoadWidth = 0.1f + fPerspective * 0.9f;
+                float fClipWidth = fRoadWidth * 0.12f;
+                fRoadWidth *= 0.5f;
+                int nRow = nScreenHeight / 2 + y;
+
+                for (int x = 0; x < nScreenWidth; x++) {
+                    float fWorldX = (float)x / nScreenWidth;
+                    int nPixel = nRow * nScreenWidth + x;
+                    int nStripeState = (int)(25.0f * powf(1.0f - fPerspective, 2.5f) + player.fDistance * 0.2f) % 2;
+                    if (fWorldX >= fMiddlePoint - fRoadWidth && fWorldX <= fMiddlePoint + fRoadWidth) {
+                        screen[nPixel] = CHAR_DARK; 
+                        if (abs(fWorldX - fMiddlePoint) < 0.015f && nStripeState) screen[nPixel] = CHAR_LIGHT;
+                    }
+                    else if (fWorldX >= fMiddlePoint - fRoadWidth - fClipWidth && fWorldX <= fMiddlePoint + fRoadWidth + fClipWidth) {
+                        if (player.bCrashed && (int)(fTotalTime * 10) % 2 == 0) screen[nPixel] = L'X'; 
+                        else screen[nPixel] = nStripeState ? CHAR_FULL : CHAR_LIGHT;
+                    }
+                    else screen[nPixel] = CHAR_LIGHT; 
+                }
+            }
+
+            int nCarPos = nScreenWidth / 2; 
+            int nCarY = nScreenHeight - 7;
+            wstring carSprite[] = { L"   \u2584\u2588\u2584   ", L" \u2590\u2588\u2593\u2593\u2588\u258c ", L" \u258C\u2588\u2593\u2593\u2588\u2590 ", L" \u2580\u2588\u2580\u2580\u2588\u2580 " };
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 8; j++) if (carSprite[i][j] != L' ') screen[(nCarY + i) * nScreenWidth + nCarPos - 4 + j] = carSprite[i][j];
+            }
+
+            // UI
+            KernelDrawBox(screen, 1, 1, 28, 8); 
+            KernelDrawString(screen, 3, 2, L"SYSTEM MONITOR");
+            wchar_t buf[64];
+            swprintf(buf, 64, L"POS_X: %+.4f", player.fX_Register);
+            KernelDrawString(screen, 3, 3, buf);
+            
+            wstring status = L"STATUS: RUNNING";
+            if (player.bCrashed) { status = L"STATUS: SEG_FAULT!"; KernelDrawString(screen, 3, 7, L">> PRESS DOWN <<"); }
+            KernelDrawString(screen, 3, 4, status);
+
+            if (player.fSpeed < 0) {
+                KernelDrawString(screen, 3, 5, L"GEAR : REVERSE   ");
+            } else {
+                swprintf(buf, 64, L"SPEED: %3d KM/H   ", (int)player.fSpeed);
+                KernelDrawString(screen, 3, 5, buf);
+            }
+
+            KernelDrawString(screen, 3, 6, L"[                    ]");
+            int posBar = (int)((player.fX_Register + 1.0f) * 10.0f); 
+            if (posBar < 0) posBar = 0; if (posBar > 20) posBar = 20;
+            screen[6 * nScreenWidth + 4 + posBar] = L'|';
+
+            DrawMiniMap(screen, nScreenWidth - 32, 1, 30, 15);
+        }
+
+        screen[nScreenWidth * nScreenHeight - 1] = '\0';
+        WriteConsoleOutputCharacterW(hConsole, screen, nScreenWidth * nScreenHeight, { 0,0 }, &dwBytesWritten);
+    }
+
+    return 0;
+}
