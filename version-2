@@ -1,0 +1,495 @@
+/*
+ * OS Racer - Final Edition v5.1 (Fixed)
+ * Update: Fixed missing 'EnforceBoundaryProtection' function.
+ * Features: Finish Line, Map Preview, Win Screen, Enhanced Sprites.
+ * Author: Gemini
+ */
+
+// 啟用 C++11
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cwchar> 
+#include <windows.h>
+
+using namespace std;
+
+// --- 系統常數 ---
+const int nScreenWidth = 120;
+const int nScreenHeight = 40;
+const float ROAD_WIDTH_LIMIT = 1.0f; 
+
+// Unicode 視覺資產
+const wchar_t CHAR_FULL = L'\u2588';
+const wchar_t CHAR_DARK = L'\u2593'; 
+const wchar_t CHAR_MED = L'\u2592';
+const wchar_t CHAR_LIGHT = L'\u2591';
+const wchar_t CHAR_EMPTY = L' ';
+
+enum GameState { BOOT_MENU, MAP_SELECT, KERNEL_RUNNING, GAME_WIN, SYSTEM_HALT };
+GameState currentState = BOOT_MENU;
+
+// --- PCB (玩家狀態) ---
+struct PlayerPCB {
+    float fX_Register;
+    float fSpeed;
+    float fDistance;
+    float fCurvature;
+    float fPlayerCurvature;
+    bool bCrashed;
+    int nSteerState; // -1:Left, 0:Straight, 1:Right
+
+    PlayerPCB() { Reset(); }
+    void Reset() {
+        fX_Register = 0; fSpeed = 0; fDistance = 0; fCurvature = 0; fPlayerCurvature = 0; 
+        bCrashed = false; nSteerState = 0;
+    }
+};
+PlayerPCB player; 
+
+// --- 賽道數據 ---
+struct TrackSegment {
+    float fCurvature;
+    float fDistance;
+};
+vector<TrackSegment> vecTrack; // 當前遊戲用的賽道
+float fTotalTrackLength = 0;
+
+// 用於儲存地圖預覽點 (Map 1, 2, 3)
+vector<pair<float, float>> vecMapPointsCurrent; // 遊戲中用
+vector<pair<float, float>> vecMapPreview1;      // 選單預覽用
+vector<pair<float, float>> vecMapPreview2;
+vector<pair<float, float>> vecMapPreview3;
+
+// --- 繪圖核心 ---
+void KernelDrawBox(wchar_t* screen, int x, int y, int w, int h) {
+    for (int i = 0; i < h; i++) {
+        for (int j = 0; j < w; j++) {
+            int px = x + j;
+            int py = y + i;
+            if (px >= 0 && px < nScreenWidth && py >= 0 && py < nScreenHeight) {
+                 if (i == 0 || i == h - 1) screen[py * nScreenWidth + px] = L'\u2550';
+                else if (j == 0 || j == w - 1) screen[py * nScreenWidth + px] = L'\u2551';
+                else screen[py * nScreenWidth + px] = CHAR_EMPTY;
+                
+                if (i==0 && j==0) screen[py * nScreenWidth + px] = L'\u2554';
+                else if (i==0 && j==w-1) screen[py * nScreenWidth + px] = L'\u2557';
+                else if (i==h-1 && j==0) screen[py * nScreenWidth + px] = L'\u255A';
+                else if (i==h-1 && j==w-1) screen[py * nScreenWidth + px] = L'\u255D';
+            }
+        }
+    }
+}
+
+void KernelDrawString(wchar_t* screen, int x, int y, wstring text) {
+    for (int i = 0; i < text.length(); i++) {
+        if (x + i >= 0 && x + i < nScreenWidth && y >= 0 && y < nScreenHeight)
+            screen[y * nScreenWidth + x + i] = text[i];
+    }
+}
+
+// --- 地圖生成器 ---
+// 生成賽道點 (用於預覽和遊戲中GPS)
+void GenerateMapPoints(const vector<TrackSegment>& track, vector<pair<float, float>>& points) {
+    points.clear();
+    float x = 0, y = 0, angle = 0;
+    for (auto t : track) {
+        float fSegmentStep = 5.0f; 
+        for (float d = 0; d < t.fDistance; d += fSegmentStep) {
+            angle += t.fCurvature * 0.01f; 
+            x += sinf(angle) * fSegmentStep;
+            y += cosf(angle) * fSegmentStep;
+            points.push_back({ x, y });
+        }
+    }
+}
+
+// 建立賽道數據
+void BuildTrackData(int mapID, vector<TrackSegment>& targetTrack) {
+    targetTrack.clear();
+    if (mapID == 1) { // 環狀賽道
+        targetTrack.push_back({ 0.0f, 50.0f });
+        targetTrack.push_back({ 0.5f, 400.0f });
+        targetTrack.push_back({ 0.0f, 50.0f });
+        targetTrack.push_back({ 0.5f, 400.0f });
+        targetTrack.push_back({ 0.0f, 100.0f }); // 終點緩衝
+    }
+    else if (mapID == 2) { // 技術型
+        targetTrack.push_back({ 0.0f, 50.0f });
+        targetTrack.push_back({ 0.3f, 200.0f });
+        targetTrack.push_back({ 0.0f, 100.0f });
+        targetTrack.push_back({ -0.4f, 150.0f });
+        targetTrack.push_back({ 0.0f, 150.0f });
+        targetTrack.push_back({ -0.2f, 200.0f });
+        targetTrack.push_back({ 0.6f, 150.0f });
+        targetTrack.push_back({ 0.0f, 200.0f });
+    }
+    else if (mapID == 3) { // 直線加速
+        targetTrack.push_back({ 0.0f, 600.0f });
+        targetTrack.push_back({ -1.0f, 100.0f });
+        targetTrack.push_back({ 0.0f, 200.0f });
+        targetTrack.push_back({ 1.0f, 100.0f });
+        targetTrack.push_back({ 0.0f, 400.0f });
+    }
+}
+
+// 初始化所有預覽圖
+void InitMaps() {
+    vector<TrackSegment> tempTrack;
+    BuildTrackData(1, tempTrack); GenerateMapPoints(tempTrack, vecMapPreview1);
+    BuildTrackData(2, tempTrack); GenerateMapPoints(tempTrack, vecMapPreview2);
+    BuildTrackData(3, tempTrack); GenerateMapPoints(tempTrack, vecMapPreview3);
+}
+
+// 載入選定的地圖進入遊戲
+void LoadMapIntoGame(int mapID) {
+    BuildTrackData(mapID, vecTrack);
+    GenerateMapPoints(vecTrack, vecMapPointsCurrent);
+    fTotalTrackLength = 0;
+    for(auto t : vecTrack) fTotalTrackLength += t.fDistance;
+    // 扣除最後一點緩衝，讓終點線精確一點
+    fTotalTrackLength -= 20.0f; 
+}
+
+// --- 通用地圖繪製函式 (Menu & HUD) ---
+void DrawTrackView(wchar_t* screen, int x, int y, int w, int h, const vector<pair<float, float>>& points, bool bShowPlayer) {
+    // 畫框
+    KernelDrawBox(screen, x, y, w, h);
+    
+    if (points.empty()) return;
+
+    // 找出邊界
+    float minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+    for (auto p : points) {
+        if (p.first < minX) minX = p.first;
+        if (p.first > maxX) maxX = p.first;
+        if (p.second < minY) minY = p.second;
+        if (p.second > maxY) maxY = p.second;
+    }
+    
+    float rangeX = maxX - minX; if(rangeX == 0) rangeX = 1;
+    float rangeY = maxY - minY; if(rangeY == 0) rangeY = 1;
+    
+    // 縮放以適應框框 (保留邊距)
+    float scaleX = (float)(w - 4) / rangeX;
+    float scaleY = (float)(h - 4) / rangeY;
+    float scale = (scaleX < scaleY) ? scaleX : scaleY; 
+
+    // 繪製賽道線條
+    for (auto p : points) {
+        int px = x + 2 + (int)((p.first - minX) * scale);
+        // Y軸反轉，讓地圖方向正確 (上是前)
+        int py = y + h - 2 - (int)((p.second - minY) * scale); 
+        
+        if(px >= x && px < x + w && py >= y && py < y + h)
+            screen[py * nScreenWidth + px] = L'\u25aa'; // 小方塊
+    }
+
+    // 繪製玩家 (如果是遊戲中)
+    if (bShowPlayer) {
+        int playerIndex = (int)((player.fDistance / fTotalTrackLength) * points.size());
+        if (playerIndex >= points.size()) playerIndex = points.size() - 1;
+        if (playerIndex < 0) playerIndex = 0;
+        
+        pair<float, float> pos = points[playerIndex];
+        int px = x + 2 + (int)((pos.first - minX) * scale);
+        int py = y + h - 2 - (int)((pos.second - minY) * scale);
+        
+        if(px >= x && px < x + w && py >= y && py < y + h)
+            screen[py * nScreenWidth + px] = L'O'; // 玩家圓點
+    }
+}
+
+// --- [FIXED] 補回撞牆判定函式 ---
+void EnforceBoundaryProtection() {
+    float fLeftLimit = -ROAD_WIDTH_LIMIT;
+    float fRightLimit = ROAD_WIDTH_LIMIT;
+    
+    // 解鎖
+    if (player.bCrashed && player.fSpeed < -0.1f) player.bCrashed = false; 
+
+    // 撞牆判定
+    if (player.fX_Register < fLeftLimit) {
+        player.fX_Register = fLeftLimit;
+        if (player.fSpeed > 0) { player.fSpeed = 0; player.bCrashed = true; }
+    }
+    if (player.fX_Register > fRightLimit) {
+        player.fX_Register = fRightLimit;
+        if (player.fSpeed > 0) { player.fSpeed = 0; player.bCrashed = true; }
+    }
+}
+
+int main() {
+    wchar_t* screen = new wchar_t[nScreenWidth * nScreenHeight];
+    HANDLE hConsole = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE, 0, NULL, CONSOLE_TEXTMODE_BUFFER, NULL);
+    SetConsoleActiveScreenBuffer(hConsole);
+    
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hConsole, &cursorInfo);
+    cursorInfo.bVisible = FALSE;
+    SetConsoleCursorInfo(hConsole, &cursorInfo);
+
+    InitMaps(); // 預先生成地圖預覽
+
+    DWORD dwBytesWritten = 0;
+    auto tp1 = chrono::system_clock::now();
+    auto tp2 = chrono::system_clock::now();
+    float fTotalTime = 0.0f;
+    int nSelectedMap = 1; // 預設選擇地圖 1
+
+    while (currentState != SYSTEM_HALT) {
+        tp2 = chrono::system_clock::now();
+        chrono::duration<float> elapsedTime = tp2 - tp1;
+        tp1 = tp2;
+        float fElapsedTime = elapsedTime.count();
+        fTotalTime += fElapsedTime;
+
+        // --- 1. BOOT MENU ---
+        if (currentState == BOOT_MENU) {
+            for (int i = 0; i < nScreenWidth * nScreenHeight; i++) screen[i] = CHAR_MED;
+            int boxW = 50, boxH = 12;
+            int boxX = (nScreenWidth - boxW) / 2;
+            int boxY = (nScreenHeight - boxH) / 2;
+            KernelDrawBox(screen, boxX, boxY, boxW, boxH);
+            KernelDrawString(screen, boxX + 15, boxY + 2, L"OS RACER : KERNEL v5.1");
+            KernelDrawString(screen, boxX + 16, boxY + 6, L"[ PRESS SPACE ]");
+            
+            if (GetAsyncKeyState(VK_SPACE) & 0x1) currentState = MAP_SELECT;
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x1) currentState = SYSTEM_HALT;
+        }
+        // --- 2. MAP SELECT (地圖選擇與預覽) ---
+        else if (currentState == MAP_SELECT) {
+            for (int i = 0; i < nScreenWidth * nScreenHeight; i++) screen[i] = CHAR_MED; // 背景
+
+            // 左側選單
+            int menuX = 20, menuY = 10;
+            KernelDrawBox(screen, menuX, menuY, 30, 16);
+            KernelDrawString(screen, menuX + 8, menuY + 2, L"SELECT TRACK");
+            
+            // 選項
+            wstring s1 = (nSelectedMap == 1) ? L"> 1. BEGINNER LOOP" : L"  1. BEGINNER LOOP";
+            wstring s2 = (nSelectedMap == 2) ? L"> 2. TECHNICAL PASS" : L"  2. TECHNICAL PASS";
+            wstring s3 = (nSelectedMap == 3) ? L"> 3. ENDURANCE RUN" : L"  3. ENDURANCE RUN";
+            
+            KernelDrawString(screen, menuX + 4, menuY + 5, s1);
+            KernelDrawString(screen, menuX + 4, menuY + 7, s2);
+            KernelDrawString(screen, menuX + 4, menuY + 9, s3);
+            KernelDrawString(screen, menuX + 4, menuY + 12, L"[1,2,3] Select");
+            KernelDrawString(screen, menuX + 4, menuY + 13, L"[SPACE] Start");
+
+            // 右側預覽窗 (顯示賽道全貌)
+            int previewX = 55, previewY = 10;
+            // 根據選擇畫出不同的預覽圖
+            if (nSelectedMap == 1) DrawTrackView(screen, previewX, previewY, 40, 16, vecMapPreview1, false);
+            else if (nSelectedMap == 2) DrawTrackView(screen, previewX, previewY, 40, 16, vecMapPreview2, false);
+            else if (nSelectedMap == 3) DrawTrackView(screen, previewX, previewY, 40, 16, vecMapPreview3, false);
+            
+            KernelDrawString(screen, previewX + 12, previewY, L"TRACK PREVIEW");
+
+            // 輸入處理
+            if (GetAsyncKeyState('1') & 0x1) nSelectedMap = 1;
+            if (GetAsyncKeyState('2') & 0x1) nSelectedMap = 2;
+            if (GetAsyncKeyState('3') & 0x1) nSelectedMap = 3;
+            
+            if (GetAsyncKeyState(VK_SPACE) & 0x1) {
+                LoadMapIntoGame(nSelectedMap);
+                player.Reset();
+                currentState = KERNEL_RUNNING;
+            }
+        }
+        // --- 3. KERNEL RUNNING (遊戲中) ---
+        else if (currentState == KERNEL_RUNNING) {
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x1) currentState = MAP_SELECT;
+            
+            // 轉向控制
+            player.nSteerState = 0;
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000) { player.fX_Register -= 2.5f * fElapsedTime; player.nSteerState = -1; }
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { player.fX_Register += 2.5f * fElapsedTime; player.nSteerState = 1; }
+
+            // 速度控制
+            if (!player.bCrashed) {
+                if (GetAsyncKeyState(VK_SPACE) & 0x8000) player.fSpeed += 40.0f * fElapsedTime;
+                else if (GetAsyncKeyState(VK_DOWN) & 0x8000) player.fSpeed -= 30.0f * fElapsedTime;
+                else {
+                    if (player.fSpeed > 0) { player.fSpeed -= 15.0f * fElapsedTime; if (player.fSpeed < 0) player.fSpeed = 0; }
+                    else if (player.fSpeed < 0) { player.fSpeed += 15.0f * fElapsedTime; if (player.fSpeed > 0) player.fSpeed = 0; }
+                }
+            } else {
+                if (GetAsyncKeyState(VK_DOWN) & 0x8000) player.fSpeed -= 30.0f * fElapsedTime; else player.fSpeed = 0;
+            }
+            if (GetAsyncKeyState(VK_CONTROL) & 0x8000) player.fSpeed -= 80.0f * fElapsedTime;
+
+            EnforceBoundaryProtection();
+
+            if (player.fSpeed < -20.0f) player.fSpeed = -20.0f; 
+            if (player.fSpeed > 100.0f) player.fSpeed = 100.0f; 
+
+            player.fDistance += player.fSpeed * fElapsedTime;
+
+            // --- 終點判定 (Finish Line Logic) ---
+            if (player.fDistance >= fTotalTrackLength) {
+                player.fDistance = fTotalTrackLength; // 鎖定在終點
+                currentState = GAME_WIN; // 進入勝利畫面
+            }
+
+            // 賽道曲率計算 (不再循環，而是延伸)
+            float fOffset = 0;
+            int nTrackSection = 0;
+            float fTrackPos = player.fDistance;
+            
+            // 尋找當前段落
+            while (nTrackSection < vecTrack.size() && fTrackPos >= vecTrack[nTrackSection].fDistance) {
+                fTrackPos -= vecTrack[nTrackSection].fDistance;
+                nTrackSection++;
+            }
+            
+            float fTargetCurvature = 0;
+            // 如果還在賽道內
+            if (nTrackSection < vecTrack.size()) 
+                fTargetCurvature = vecTrack[nTrackSection].fCurvature;
+            
+            float fTrackCurveDiff = (fTargetCurvature - player.fCurvature) * fElapsedTime * abs(player.fSpeed) * 0.05f; 
+            player.fCurvature += fTrackCurveDiff;
+            player.fPlayerCurvature += player.fCurvature * fElapsedTime * player.fSpeed * 0.01f;
+
+            // --- 渲染 ---
+            // 天空
+            for (int y = 0; y < nScreenHeight / 2; y++) {
+                for (int x = 0; x < nScreenWidth; x++) {
+                    float mountainFreq = (x + player.fPlayerCurvature * 200.0f) * 0.02f;
+                    int mountainH = (int)(sinf(mountainFreq) * 8.0f + 6.0f);
+                    screen[y * nScreenWidth + x] = (y < nScreenHeight / 2 - mountainH) ? CHAR_EMPTY : CHAR_MED;
+                }
+            }
+
+            // 道路
+            for (int y = 0; y < nScreenHeight / 2; y++) {
+                float fPerspective = (float)y / (nScreenHeight / 2.0f);
+                float fMiddlePoint = 0.5f + player.fCurvature * powf(1.0f - fPerspective, 3.0f) - player.fX_Register * 0.5f;
+                float fRoadWidth = 0.1f + fPerspective * 0.9f;
+                float fClipWidth = fRoadWidth * 0.12f;
+                fRoadWidth *= 0.5f;
+                int nRow = nScreenHeight / 2 + y;
+
+                for (int x = 0; x < nScreenWidth; x++) {
+                    float fWorldX = (float)x / nScreenWidth;
+                    int nPixel = nRow * nScreenWidth + x;
+                    int nStripeState = (int)(25.0f * powf(1.0f - fPerspective, 2.5f) + player.fDistance * 0.2f) % 2;
+                    
+                    // 終點線繪製邏輯
+                    bool bDrawFinishLine = false;
+                    // 如果距離終點很近，且在當前掃描線的透視距離內
+                    float fWorldDist = player.fDistance + (1.0f / (fPerspective + 0.01f)) * 5.0f; // 粗略估算視距
+                    if (fWorldDist >= fTotalTrackLength && fWorldDist <= fTotalTrackLength + 5.0f) {
+                        bDrawFinishLine = true;
+                    }
+
+                    if (fWorldX >= fMiddlePoint - fRoadWidth && fWorldX <= fMiddlePoint + fRoadWidth) {
+                        if (bDrawFinishLine) {
+                            // 黑白方格旗紋理
+                            bool check = ((int)(fWorldX * 40) + (int)(y)) % 2 == 0;
+                            screen[nPixel] = check ? CHAR_FULL : CHAR_EMPTY;
+                        } else {
+                            screen[nPixel] = CHAR_DARK; 
+                            if (abs(fWorldX - fMiddlePoint) < 0.015f && nStripeState) screen[nPixel] = CHAR_LIGHT;
+                        }
+                    }
+                    else if (fWorldX >= fMiddlePoint - fRoadWidth - fClipWidth && fWorldX <= fMiddlePoint + fRoadWidth + fClipWidth) {
+                        if (player.bCrashed && (int)(fTotalTime * 10) % 2 == 0) screen[nPixel] = L'X'; 
+                        else screen[nPixel] = nStripeState ? CHAR_FULL : CHAR_LIGHT;
+                    }
+                    else screen[nPixel] = CHAR_LIGHT; 
+                }
+            }
+
+            // --- 車輛繪製 (升級版造型) ---
+            int nCarPos = nScreenWidth / 2; 
+            int nCarY = nScreenHeight - 6; 
+            
+            // 升級的車輛 Sprite (顯示輪胎與擋風玻璃)
+            wstring spriteStraight[] = { 
+                L"      ____      ", 
+                L"  ___/____\\___  ", 
+                L" \u2590  _      _  \u258c ", // 車燈
+                L" \u2590_[O]____[O]_\u258c "  // 輪胎
+            };
+            
+            wstring spriteLeft[] = { 
+                L"       ____     ", 
+                L"   ___/____\\    ", 
+                L"  \u2590  _     _ \\  ", 
+                L"  \u2590_[O]___[O] \\ " 
+            };
+
+            wstring spriteRight[] = { 
+                L"     ____       ", 
+                L"    /____\\___   ", 
+                L"  / _     _  \u258c  ", 
+                L" / [O]___[O]_\u258c  " 
+            };
+
+            wstring* currentSprite = spriteStraight;
+            if (player.nSteerState == -1) currentSprite = spriteLeft;
+            if (player.nSteerState == 1) currentSprite = spriteRight;
+
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 16; j++) {
+                    if (j < currentSprite[i].length() && currentSprite[i][j] != L' ') 
+                        screen[(nCarY + i) * nScreenWidth + nCarPos - 8 + j] = currentSprite[i][j];
+                }
+            }
+
+            // HUD
+            KernelDrawBox(screen, 1, 1, 28, 8); 
+            KernelDrawString(screen, 3, 2, L"SYSTEM MONITOR");
+            wchar_t buf[64];
+            swprintf(buf, 64, L"DIST : %.0f / %.0f", player.fDistance, fTotalTrackLength);
+            KernelDrawString(screen, 3, 3, buf);
+            
+            wstring status = L"STATUS: RUNNING";
+            if (player.bCrashed) { status = L"STATUS: SEG_FAULT!"; KernelDrawString(screen, 3, 7, L">> PRESS DOWN <<"); }
+            KernelDrawString(screen, 3, 4, status);
+
+            if (player.fSpeed < 0) KernelDrawString(screen, 3, 5, L"GEAR : REVERSE   ");
+            else { swprintf(buf, 64, L"SPEED: %3d KM/H   ", (int)player.fSpeed); KernelDrawString(screen, 3, 5, buf); }
+
+            KernelDrawString(screen, 3, 6, L"[                    ]");
+            int posBar = (int)((player.fX_Register + 1.0f) * 10.0f); 
+            if (posBar < 0) posBar = 0; if (posBar > 20) posBar = 20;
+            screen[6 * nScreenWidth + 4 + posBar] = L'|';
+
+            // 右上角小地圖 (傳入 true 顯示玩家位置)
+            DrawTrackView(screen, nScreenWidth - 32, 1, 30, 15, vecMapPointsCurrent, true);
+        }
+        // --- 4. GAME WIN (勝利畫面) ---
+        else if (currentState == GAME_WIN) {
+            for (int i = 0; i < nScreenWidth * nScreenHeight; i++) screen[i] = CHAR_MED;
+            int boxW = 40, boxH = 12;
+            int boxX = (nScreenWidth - boxW) / 2;
+            int boxY = (nScreenHeight - boxH) / 2;
+            KernelDrawBox(screen, boxX, boxY, boxW, boxH);
+            
+            // 閃爍文字
+            if ((int)(fTotalTime * 5) % 2 == 0)
+                KernelDrawString(screen, boxX + 10, boxY + 2, L"*** FINISHED! ***");
+            else 
+                KernelDrawString(screen, boxX + 10, boxY + 2, L"                  ");
+
+            wchar_t buf[64];
+            swprintf(buf, 64, L"TOTAL TIME: %.2f sec", fTotalTime); // 這裡簡單用總時間，實際應該記錄單圈
+            KernelDrawString(screen, boxX + 8, boxY + 5, buf);
+            
+            KernelDrawString(screen, boxX + 8, boxY + 8, L"Press [SPACE] to Menu");
+
+            if (GetAsyncKeyState(VK_SPACE) & 0x1) currentState = BOOT_MENU;
+        }
+
+        screen[nScreenWidth * nScreenHeight - 1] = '\0';
+        WriteConsoleOutputCharacterW(hConsole, screen, nScreenWidth * nScreenHeight, { 0,0 }, &dwBytesWritten);
+    }
+
+    return 0;
+}
