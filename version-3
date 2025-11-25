@@ -1,0 +1,400 @@
+// C++11 
+//version 3.0 
+//Author Hung page
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cwchar>
+#include <windows.h>
+using namespace std;
+
+// --- System constant  ---
+const int nScreenWidth = 120;
+const int nScreenHeight = 40;
+const float ROAD_WIDTH_LIMIT = 1.0f;
+
+// parameter
+const float LATERAL_FACTOR      = 0.0008f;
+const float STEER_COMPENSATION  = 0.015f;
+const float HEADING_TURN_SPEED  = 1.8f;
+const float HEADING_DRIFT_FACTOR = 0.008f;
+const float MAX_SPEED = 200.0f;
+const float ACCELERATION = 25.0f;
+const float DECELERATION = 20.0f;
+const float FRICTION = 0.9999f;
+
+// Unicode
+const wchar_t CHAR_FULL  = L'█';
+const wchar_t CHAR_DARK  = L'▓';
+const wchar_t CHAR_MED   = L'▒';
+const wchar_t CHAR_LIGHT = L'░';
+const wchar_t CHAR_EMPTY = L' ';
+
+enum GameState { BOOT_MENU, MAP_SELECT, KERNEL_RUNNING, GAME_WIN, GAME_OVER, SYSTEM_HALT };
+GameState currentState = BOOT_MENU;
+
+// --- player status ---
+struct PlayerPCB {
+    float fX_Register = 0;
+    float fSpeed = 0;
+    float fDistance = 0;
+    float fCurvature = 0;
+    float fPlayerCurvature = 0;
+    float fHeadingAngle = 0;
+    bool bCrashed = false;
+    int nSteerState = 0;
+    void Reset() { *this = PlayerPCB(); }
+} player;
+
+// --- Track information ---
+struct TrackSegment { float fCurvature; float fDistance; };
+vector<TrackSegment> vecTrack;
+float fTotalTrackLength = 0;
+vector<pair<float,float>> vecMapPointsCurrent;
+vector<pair<float,float>> vecMapPreview[3];
+
+// draw
+void KernelDrawBox(wchar_t* s, int x, int y, int w, int h) {
+    for (int i = 0; i < h; ++i) for (int j = 0; j < w; ++j) {
+        int px = x+j, py = y+i;
+        if (px<0||px>=nScreenWidth||py<0||py>=nScreenHeight) continue;
+        wchar_t c = (i==0||i==h-1)?L'═':(j==0||j==w-1)?L'║':L' ';
+        if (i==0&&j==0) c=L'╔'; if(i==0&&j==w-1)c=L'╗';
+        if(i==h-1&&j==0)c=L'╚'; if(i==h-1&&j==w-1)c=L'╝';
+        s[py*nScreenWidth + px] = c;
+    }
+}
+
+// draw screen
+void KernelDrawString(wchar_t* s, int x, int y, wstring t) {
+    for(size_t i=0; i<t.size() && x+i<nScreenWidth; ++i)
+        if(y>=0&&y<nScreenHeight) s[y*nScreenWidth + x+i] = t[i];
+}
+
+// ---Map/track data---
+void GenerateMapPoints(const vector<TrackSegment>& track, vector<pair<float,float>>& points) {
+    points.clear();
+    float x=0, y=0, angle=0;
+    const float STEP=1.0f;  
+    for(auto& seg: track) {
+        for(float d=0; d<seg.fDistance; d+=STEP) {
+            angle += seg.fCurvature*STEP*0.01f;
+            x += sinf(angle)*STEP;
+            y += cosf(angle)*STEP;
+            points.emplace_back(x,y);
+        }
+    }
+}
+
+void BuildTrackData(int id, vector<TrackSegment>& t) {
+    t.clear();
+    if(id==1){ 
+        t.push_back({0.0f,80}); t.push_back({0.6f,250}); t.push_back({-0.6f,250});
+        t.push_back({0.0f,100}); t.push_back({0.8f,200}); t.push_back({0.0f,120});
+    } else if(id==2){ 
+        t.push_back({0.0f,100}); t.push_back({0.7f,150}); t.push_back({-0.5f,150});
+        t.push_back({0.9f,200}); t.push_back({0.0f,100}); t.push_back({-0.8f,180});
+        t.push_back({0.6f,200}); t.push_back({0.0f,150}); t.push_back({1.0f,120}); t.push_back({0.0f,100});
+    } else if(id==3){ 
+        t.push_back({0.0f,100}); t.push_back({0.8f,200}); t.push_back({-0.6f,150});
+        t.push_back({0.6f,180}); t.push_back({-0.8f,200}); t.push_back({0.5f,150});
+        t.push_back({-0.5f,150}); t.push_back({0.8f,200}); t.push_back({-0.8f,200}); t.push_back({0.0f,100}); 
+    }else if(id==3){ 
+        t.push_back({0.0f,100}); t.push_back({0.8f,200}); t.push_back({-0.6f,150});
+        t.push_back({0.6f,180}); t.push_back({-0.8f,200}); t.push_back({0.5f,150});
+        t.push_back({-0.5f,150}); t.push_back({0.8f,200}); t.push_back({-0.8f,200}); t.push_back({0.0f,100}); 
+    } 
+}
+
+void InitMaps() {
+    vector<TrackSegment> tmp;
+    for(int i=0;i<3;i++){ BuildTrackData(i+1,tmp); GenerateMapPoints(tmp,vecMapPreview[i]); }
+}
+
+void LoadMap(int id){
+    BuildTrackData(id,vecTrack);
+    GenerateMapPoints(vecTrack,vecMapPointsCurrent);
+    fTotalTrackLength=0;
+    for(auto& s: vecTrack) fTotalTrackLength += s.fDistance;
+}
+
+// --- small map---
+void DrawTrackView(wchar_t* s, int x, int y, int w, int h, const vector<pair<float,float>>& p, bool showPlayer){
+    KernelDrawBox(s,x,y,w,h);
+    KernelDrawString(s, x+1, y+1, L"TRACK MAP");
+    
+    if(p.empty()) return;
+    float mx=1e9,Mx=-1e9,my=1e9,My=-1e9;
+    for(auto& pt: p){ mx=min(mx,pt.first); Mx=max(Mx,pt.first); my=min(my,pt.second); My=max(My,pt.second); }
+    float rx = Mx-mx?Mx-mx:1, ry = My-my?My-my:1;
+    float sx = (w-4)/rx, sy = (h-4)/ry; float sc = min(sx,sy);
+    
+    for(auto& pt: p){
+        int px = x+2 + (int)((pt.first-mx)*sc);
+        int py = y+h-2 - (int)((pt.second-my)*sc);
+        if(px>=x+1 && px<x+w-1 && py>=y+1 && py<y+h-1) s[py*nScreenWidth+px]=CHAR_FULL;
+    }
+    
+    if(showPlayer && player.fDistance<=fTotalTrackLength){
+        int idx = (int)((player.fDistance/fTotalTrackLength)*p.size());
+        idx = min(idx,(int)p.size()-1);
+        auto pos = p[idx];
+        int px = x+2 + (int)((pos.first-mx)*sc);
+        int py = y+h-2 - (int)((pos.second-my)*sc);
+        if(px>=x && px<x+w && py>=y && py<y+h) s[py*nScreenWidth+px]=L'★'; // 玩家位置
+    }
+}
+
+// --- Dashboard ---
+void DrawSpeedometer(wchar_t* s) {
+    int w = 24, h = 7;
+    int x = 1, y = 11;
+    KernelDrawBox(s, x, y, w, h);
+    KernelDrawString(s, x + 3, y + 1, L"SPEEDOMETER");
+
+    float currentSpeed = player.fSpeed;
+    float ratio = max(0.0f, min(1.0f, currentSpeed / MAX_SPEED));
+    
+    int max_bar_width = w - 4; 
+    int filled_width = (int)(ratio * max_bar_width);
+
+    int row = y + 3;
+    
+    // speed bar
+    for (int i = 0; i < max_bar_width; ++i) {
+        wchar_t bar_char = CHAR_LIGHT; 
+        if (i < filled_width) {
+            if (ratio < 0.33f) bar_char = CHAR_MED; 
+            else if (ratio < 0.66f) bar_char = CHAR_DARK;
+            else bar_char = CHAR_FULL;
+        }
+        
+        int px = x + 2 + i;
+        if(px < x+w-2) s[row * nScreenWidth + px] = bar_char;
+    }
+    
+    // speed value
+    wchar_t buf[80];
+    swprintf(buf, 80, L"%3d km/h", (int)currentSpeed);
+    KernelDrawString(s, x + 7, y + 5, buf);
+}
+
+// --- border ---
+void EnforceBoundaryProtection(){
+    if(player.fX_Register < -ROAD_WIDTH_LIMIT || player.fX_Register > ROAD_WIDTH_LIMIT){
+        if(!player.bCrashed){
+            player.bCrashed = true;
+            player.fSpeed = 0;
+            player.fX_Register = max(-ROAD_WIDTH_LIMIT, min(ROAD_WIDTH_LIMIT, player.fX_Register));
+            currentState = GAME_OVER;
+        }
+    }
+}
+
+// --- main ---
+int main(){
+    wchar_t* screen = new wchar_t[nScreenWidth*nScreenHeight];
+    HANDLE hConsole = CreateConsoleScreenBuffer(GENERIC_READ|GENERIC_WRITE,0,NULL,CONSOLE_TEXTMODE_BUFFER,NULL);
+    SetConsoleActiveScreenBuffer(hConsole);
+    CONSOLE_CURSOR_INFO ci={1,0}; SetConsoleCursorInfo(hConsole,&ci);
+    
+    InitMaps();
+
+    DWORD dwBytesWritten=0;
+    auto tp1 = chrono::system_clock::now(), tp2=tp1;
+    float fTotalTime=0;
+    int nSelectedMap=1;
+    wstring maps[3]={L"1. ADVANCED S-CURVE",L"2. EXPERT SLALOM",L"3. EXTREME CIRCULAR"};
+    wstring desc[6] = {
+        L"LEVEL 1", L"",
+        L"LEVEL 2", L"",
+        L"LEVEL 3", L""
+    };
+
+    while(currentState != SYSTEM_HALT){
+        tp2 = chrono::system_clock::now();
+        float fElapsedTime = chrono::duration<float>(tp2-tp1).count();
+        tp1 = tp2;
+        if(fElapsedTime > 0.05f) fElapsedTime = 0.05f;
+
+        if(currentState == KERNEL_RUNNING)
+            fTotalTime += fElapsedTime;
+
+        fill(screen, screen + nScreenWidth * nScreenHeight, CHAR_EMPTY);
+
+        // ==================== BOOT MENU ====================
+        if(currentState==BOOT_MENU){
+            KernelDrawBox(screen,35,14,50,12);
+            KernelDrawString(screen,50,18,L"OS RACER : KERNEL v3.0");
+            KernelDrawString(screen,48,22,L"[ PRESS SPACE TO START ]");
+            if(GetAsyncKeyState(VK_SPACE)&1) currentState=MAP_SELECT;
+            if(GetAsyncKeyState(VK_ESCAPE)&1) currentState=SYSTEM_HALT;
+        }
+
+        // ==================== MAP SELECT ====================
+        else if(currentState==MAP_SELECT){
+            
+            KernelDrawBox(screen,15,8,34,14);
+            KernelDrawString(screen,24,10,L"SELECT TRACK");
+
+            for(int i=0;i<3;i++){
+                wstring txt = (nSelectedMap==i+1)? L"▶ " + maps[i] : L"  " + maps[i];
+                KernelDrawString(screen,20,13+i*2,txt);
+            }
+            
+            // DrawBox
+            KernelDrawBox(screen, 15, 23, 34, 7);
+            KernelDrawString(screen, 17, 24, L"DESCRIPTION:");
+            KernelDrawString(screen, 17, 25, desc[(nSelectedMap-1)*2]);
+            KernelDrawString(screen, 17, 26, desc[(nSelectedMap-1)*2+1]);
+
+            KernelDrawString(screen,20,32,L"[↑↓] Select [SPACE] Start");
+
+            DrawTrackView(screen, 55,8,40,22,vecMapPreview[nSelectedMap-1],false);
+            
+            // KeyState
+            if(GetAsyncKeyState(VK_UP)&1) nSelectedMap = max(1,nSelectedMap-1);
+            if(GetAsyncKeyState(VK_DOWN)&1) nSelectedMap = min(3,nSelectedMap+1);
+            if(GetAsyncKeyState('1')&1) nSelectedMap=1;
+            if(GetAsyncKeyState('2')&1) nSelectedMap=2;
+            if(GetAsyncKeyState('3')&1) nSelectedMap=3;
+            if(GetAsyncKeyState(VK_SPACE)&1){ LoadMap(nSelectedMap); player.Reset(); fTotalTime=0; currentState=KERNEL_RUNNING; }
+            if(GetAsyncKeyState(VK_ESCAPE)&1) currentState=BOOT_MENU;
+        }
+
+        // ==================== GAME RUNNING ====================
+        else if(currentState==KERNEL_RUNNING){
+            if(GetAsyncKeyState(VK_ESCAPE)&1) currentState=MAP_SELECT;
+
+            // --- (W/A/S/D + ↑↓←→) ---
+            player.nSteerState = 0;
+            if ((GetAsyncKeyState('A') & 0x8000) || (GetAsyncKeyState(VK_LEFT) & 0x8000)) { player.fHeadingAngle -= HEADING_TURN_SPEED*fElapsedTime; player.nSteerState=-1; }
+            if ((GetAsyncKeyState('D') & 0x8000) || (GetAsyncKeyState(VK_RIGHT) & 0x8000)) { player.fHeadingAngle += HEADING_TURN_SPEED*fElapsedTime; player.nSteerState=1; }
+            if(player.nSteerState==0) player.fHeadingAngle *= 0.95f;
+            if(!player.bCrashed){
+                if ((GetAsyncKeyState('W') & 0x8000) || (GetAsyncKeyState(VK_UP) & 0x8000)) player.fSpeed += ACCELERATION*fElapsedTime;
+                else player.fSpeed *= FRICTION;
+                if ((GetAsyncKeyState('S') & 0x8000) || (GetAsyncKeyState(VK_DOWN) & 0x8000)) player.fSpeed -= DECELERATION*fElapsedTime;
+            } else player.fSpeed=0;
+            player.fSpeed = max(-15.0f, min(MAX_SPEED, player.fSpeed));
+
+            player.fDistance += player.fSpeed*fElapsedTime;
+            if(player.fDistance>=fTotalTrackLength){ player.fDistance=fTotalTrackLength; currentState=GAME_WIN; }
+
+            float pos = player.fDistance, targetCurv=0; int section=0;
+            if(player.fDistance<fTotalTrackLength){
+                while(section<(int)vecTrack.size() && pos>=vecTrack[section].fDistance){ pos-=vecTrack[section].fDistance; section++; }
+                if(section<(int)vecTrack.size()) targetCurv = vecTrack[section].fCurvature;
+            }
+            player.fCurvature += (targetCurv - player.fCurvature) * fElapsedTime *3.0f;
+            player.fPlayerCurvature += player.fCurvature*fElapsedTime*player.fSpeed*0.01f;
+            float steerInput=(float)player.nSteerState*0.5f;
+            float fInertiaSlide=-player.fCurvature*player.fSpeed*LATERAL_FACTOR;
+            float compensation=steerInput*STEER_COMPENSATION;
+            float headingDrift=player.fHeadingAngle*player.fSpeed*HEADING_DRIFT_FACTOR;
+            float fNetForce=(fInertiaSlide+compensation+headingDrift)*40.0f;
+            player.fX_Register += fNetForce*fElapsedTime;
+            EnforceBoundaryProtection();
+            if(player.bCrashed) continue;
+ 
+
+            // --- Rendering ---
+            for(int y=0;y<nScreenHeight/2;y++){
+                for(int x=0;x<nScreenWidth;x++){
+                    float f = (x+player.fPlayerCurvature*200 - player.fX_Register*30)*0.02f;
+                    int h = (int)(sinf(f)*8+6);
+                    screen[y*nScreenWidth+x] = (y < nScreenHeight/2 - h)? CHAR_EMPTY : CHAR_MED; 
+                }
+            }
+
+            for(int y=0;y<nScreenHeight/2;y++){
+                float pers = (float)y/(nScreenHeight/2);
+                float mid  = 0.5f + player.fCurvature*powf(1-pers,3) - player.fX_Register*0.5f;
+                float roadW = 0.1f + pers*0.9f;
+                float clipW = roadW*0.12f;
+                roadW *= 0.5f;
+                int row = nScreenHeight/2 + y;
+
+                float fDistToHorizon = (1.0f/(pers+0.01f))*5.0f;
+                float fWorldDist = player.fDistance + fDistToHorizon;
+
+                bool bDrawFinishLine=false;
+                if(fWorldDist>=fTotalTrackLength -3.0f && fWorldDist<=fTotalTrackLength+5.0f) bDrawFinishLine=true;
+
+                for(int x=0;x<nScreenWidth;x++){
+                    float wx=(float)x/nScreenWidth;
+                    int nPixel=row*nScreenWidth+x;
+                    int stripe=(int)(25*powf(1-pers,2.5f)+player.fDistance*0.2f)%2;
+
+                    if(wx>=mid-roadW && wx<=mid+roadW){
+                        if(bDrawFinishLine && player.fDistance<fTotalTrackLength){
+                            bool check=((int)(wx*40)+(int)(y))%2==0; 
+                            screen[nPixel]=check?CHAR_FULL:CHAR_EMPTY;
+                        } else {
+                            screen[nPixel]=CHAR_DARK;
+                            if(abs(wx-mid)<0.005f && stripe) screen[nPixel]=CHAR_LIGHT;
+                        }
+                    } else if(wx>=mid-roadW-clipW && wx<=mid+roadW+clipW){
+                        screen[nPixel] = (stripe?CHAR_FULL:CHAR_LIGHT);
+                    } else screen[nPixel]=CHAR_LIGHT;
+                }
+            }
+
+            // --- SYSTEM MONITOR ---
+            KernelDrawBox(screen,1,1,30,9);
+            KernelDrawString(screen,3,2,L"SYSTEM MONITOR");
+            wchar_t buf[80];
+            swprintf(buf,80,L"DIST : %.0f / %.0f",player.fDistance,fTotalTrackLength);
+            KernelDrawString(screen,3,4,buf);
+            swprintf(buf,80,L"TIME : %.2f sec",fTotalTime);
+            KernelDrawString(screen,3,6,buf);
+            
+            // --- dashboard ---
+            DrawSpeedometer(screen);
+
+            // --- smallmap ---
+            DrawTrackView(screen, nScreenWidth-33,1,31,15,vecMapPointsCurrent,true);
+        }
+
+        // ==================== GAME OVER ====================
+        else if(currentState==GAME_OVER){
+            KernelDrawBox(screen,40,14,40,12);
+            KernelDrawString(screen,45,18,L"!!! CRASHED !!!!");
+            KernelDrawString(screen,46,21,L"DISTANCE: ");
+            KernelDrawString(screen,46,22,L"TOTAL TIME: ");
+            KernelDrawString(screen,48,24,L"Press [SPACE] to Menu");
+            
+            wchar_t buf[80];
+            swprintf(buf,80,L"%.0f m",player.fDistance);
+            KernelDrawString(screen,56,21,buf);
+            swprintf(buf,80,L"%.2f sec",fTotalTime);
+            KernelDrawString(screen,58,22,buf);
+            
+            if(GetAsyncKeyState(VK_SPACE)&1) currentState=BOOT_MENU;
+        }
+
+        // ==================== GAME WIN ====================
+        else if(currentState==GAME_WIN){
+            KernelDrawBox(screen,40,14,40,12);
+            KernelDrawString(screen,48,18,L"*** FINISHED! ***");
+            KernelDrawString(screen,46,21,L"TOTAL TIME: ");
+            KernelDrawString(screen,48,24,L"Press [SPACE] to Menu");
+
+            wchar_t buf[80];
+            swprintf(buf,80,L"%.2f sec",fTotalTime);
+            KernelDrawString(screen,58,21,buf);
+            
+            if(GetAsyncKeyState(VK_SPACE)&1) currentState=BOOT_MENU;
+        }
+
+        // --- screen buffer ---
+        screen[nScreenWidth*nScreenHeight-1]=L'\0';
+        WriteConsoleOutputCharacterW(hConsole,screen,nScreenWidth*nScreenHeight,{0,0},&dwBytesWritten);
+    }
+
+    delete[] screen;
+    return 0;
+}
